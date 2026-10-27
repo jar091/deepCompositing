@@ -228,6 +228,9 @@ struct PTCDevice : public anari::DeviceImpl, helium::ParameterizedObject
   uint32_t m_refCount{1};
   anari::DeviceImpl *m_ptd{nullptr};
   std::vector<FrameWrapper *> m_frameWrappers;
+  /*! communicator used by frames created after it was set; device
+      parameter "mpiCommunicator" (VOID_POINTER to an MPI_Comm) */
+  MPI_Comm m_comm{MPI_COMM_WORLD};
 
   static int s_numMpiPTCDevices;
   static bool s_mpiInitializedPrivately;

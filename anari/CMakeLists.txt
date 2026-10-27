@@ -18,14 +18,23 @@ find_package(anari 0.8.0 REQUIRED)
 
 ## PTC device target ##
 
-project(anari_library_ptc LANGUAGES C CXX CUDA)
+if (DC_CPU)
+  project(anari_library_ptc LANGUAGES C CXX)
+  # FrameWrapper.cu holds both implementations; in the CPU build it is
+  # plain C++ (no kernels, see the DC_CPU sections in it)
+  set_source_files_properties(FrameWrapper.cu PROPERTIES LANGUAGE CXX)
+else()
+  project(anari_library_ptc LANGUAGES C CXX CUDA)
+endif()
 
 project_add_library(MODULE PTCDevice.cpp PTCLibrary.cpp FrameWrapper.cu)
 project_link_libraries(anari::helium deepCompositing)
 
-set_source_files_properties(FrameWrapper.cu
-  PROPERTIES COMPILE_FLAGS "--expt-relaxed-constexpr"
-)
+if (NOT DC_CPU)
+  set_source_files_properties(FrameWrapper.cu
+    PROPERTIES COMPILE_FLAGS "--expt-relaxed-constexpr"
+  )
+endif()
 
 include(GenerateExportHeader)
 generate_export_header(${PROJECT_NAME} EXPORT_MACRO_NAME "PTC_EXPORT")
@@ -34,6 +43,11 @@ project_include_directories(PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 ## Installation ##
 
 include(GNUInstallDirs)
+
+if (DC_CPU)
+  # find the installed libdeepCompositing.so next to the device
+  set_target_properties(${PROJECT_NAME} PROPERTIES INSTALL_RPATH "$ORIGIN")
+endif()
 
 install(TARGETS ${PROJECT_NAME}
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

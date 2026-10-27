@@ -17,8 +17,18 @@
 #pragma once
 
 // #include "owl/common/math/vec.h"
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
+#include "dcConfig.h"
+#if DC_CPU
+/* host (CPU) build: all buffers live in host memory, 'device'
+   functions are plain inline host functions */
+# include "dc_host_math.h"
+# include <algorithm>
+# include <cstdio>
+# include <string>
+#else
+# include <cuda_runtime.h>
+# include <cuda_fp16.h>
+#endif
 #include <mpi.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -337,9 +347,59 @@ namespace dc {
 
   inline uint32_t Compositor::pixelBegin(uint32_t nodeID) const
   {
-    return nextMultipleOf((nodeID*numPixelsPadded)/numRanks(),
+    /* 64-bit product: nodeID*numPixelsPadded overflows 32 bits for
+       large frame buffers on many ranks */
+    return nextMultipleOf(uint32_t((uint64_t(nodeID)*numPixelsPadded)/numRanks()),
                           numCountersPerByte);
   }
+
+#if DC_CPU
+  // ==================================================================
+  // host-only convenience helpers (CPU build)
+  // ==================================================================
+
+  /*! write one fragment per pixel from a flat w*h image of
+      premultiplied (associated-alpha) float RGBA values plus a float
+      depth buffer, as produced by e.g. an ANARI frame with
+      channel.color=FLOAT32_VEC4 and channel.depth=FLOAT32. Pixels
+      whose alpha is <= 'minAlpha' contribute nothing and are skipped
+      (this keeps the amount of exchanged data small); depth values of
+      +inf (background) are clamped to the 'far' value of Fragment. */
+  inline void writeImageFragments(const DeviceInterface &di,
+                                  const float *rgba,
+                                  const float *depth,
+                                  float minAlpha = 0.f)
+  {
+    const int64_t numPixels = int64_t(di.fbSize.x)*di.fbSize.y;
+#pragma omp parallel for schedule(static)
+    for (int64_t i=0;i<numPixels;i++) {
+      const float *c = rgba+4*i;
+      if (!(c[3] > minAlpha)) continue;
+      di.write(int(i % di.fbSize.x),int(i / di.fbSize.x),
+               Fragment(depth[i],make_float4(c[0],c[1],c[2],c[3])));
+    }
+  }
+
+  /*! same as above, for 8-bit linear RGBA (little-endian 0xAABBGGRR,
+      ANARI_UFIXED8_VEC4) color values */
+  inline void writeImageFragments(const DeviceInterface &di,
+                                  const uint32_t *rgba8,
+                                  const float *depth)
+  {
+    const int64_t numPixels = int64_t(di.fbSize.x)*di.fbSize.y;
+#pragma omp parallel for schedule(static)
+    for (int64_t i=0;i<numPixels;i++) {
+      const uint32_t c = rgba8[i];
+      if ((c >> 24) == 0) continue;
+      const float s = 1.f/255.f;
+      di.write(int(i % di.fbSize.x),int(i / di.fbSize.x),
+               Fragment(depth[i],make_float4(s*((c >>  0) & 0xff),
+                                             s*((c >>  8) & 0xff),
+                                             s*((c >> 16) & 0xff),
+                                             s*((c >> 24) & 0xff))));
+    }
+  }
+#endif
 
 
 } // ::dc

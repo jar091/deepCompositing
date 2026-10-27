@@ -22,7 +22,12 @@
 #include <anari/frontend/type_utility.h>
 #include <anari/anari_cpp.hpp>
 
-#include "../cuda_helper.h"
+#if DC_CPU
+# include <algorithm>
+# include <cmath>
+#else
+# include "../cuda_helper.h"
+#endif
 
 namespace ptc {
 
@@ -38,6 +43,15 @@ T bit_cast(ANARIDataType type, const void *mem)
   return retval;
 }
 
+#if DC_CPU
+// Host helpers ///////////////////////////////////////////////////////////////
+
+static float linearToSrgb(float c)
+{
+  c = std::clamp(c, 0.f, 1.f);
+  return c <= 0.0031308f ? 12.92f * c : 1.055f * std::pow(c, 1.f / 2.4f) - 0.055f;
+}
+#else
 // GPU kernels ////////////////////////////////////////////////////////////////
 
 __global__ void writeFrags(dc::DeviceInterface di,
@@ -80,6 +94,7 @@ __global__ void writeFrags(dc::DeviceInterface di,
     di.write(ix, iy, frag);
   }
 }
+#endif
 
 // FrameWrapper definitions ///////////////////////////////////////////////////
 
@@ -116,11 +131,26 @@ void FrameWrapper::setParameter(
 {
   std::string_view name = _name;
 
+#if DC_CPU
+  if (name == "ptc.background") {
+    if (type == ANARI_FLOAT32_VEC4)
+      m_background = bit_cast<anari::math::float4>(type, mem);
+    return; // wrapper-only parameter
+  }
+#endif
+
   if (type == ANARI_UINT32_VEC2 && name == "size")
     m_newSize = bit_cast<anari::math::uint2>(type, mem);
-  else if (type == ANARI_DATA_TYPE && name == "channel.color")
+  else if (type == ANARI_DATA_TYPE && name == "channel.color") {
     m_newColorType = bit_cast<ANARIDataType>(type, mem);
-  else if (type == ANARI_DATA_TYPE && name == "channel.depth")
+#if DC_CPU
+    // the wrapped device always renders linear float RGBA, the requested
+    // format is only produced for the composited image
+    anari::setParameter(
+        m_device, m_frame, "channel.color", ANARI_FLOAT32_VEC4);
+    return;
+#endif
+  } else if (type == ANARI_DATA_TYPE && name == "channel.depth")
     return; // we don't want the app to turn off the depth channel
 
   anariSetParameter(m_device, m_frame, _name, type, mem);
@@ -135,6 +165,9 @@ void FrameWrapper::unsetAllParameters()
 {
   anariUnsetAllParameters(m_device, m_frame);
   anari::setParameter(m_device, m_frame, "channel.depth", ANARI_FLOAT32);
+#if DC_CPU
+  m_newColorType = ANARI_UNKNOWN;
+#endif
 }
 
 void *FrameWrapper::mapParameterArray1D(const char *name,
@@ -255,7 +288,7 @@ void FrameWrapper::discardFrame()
 
 void FrameWrapper::updateSize()
 {
-  if (m_newSize == m_currentSize)
+  if (m_newSize == m_currentSize && m_newColorType == m_currentColorType)
     return;
 
   cleanup();
@@ -269,12 +302,25 @@ void FrameWrapper::updateSize()
   if (m_currentColorType == ANARI_UNKNOWN)
     return;
 
+  const auto &size = m_currentSize;
+
+#if DC_CPU
+  if (m_currentColorType != ANARI_FLOAT32_VEC4
+      && m_currentColorType != ANARI_UFIXED8_VEC4
+      && m_currentColorType != ANARI_UFIXED8_RGBA_SRGB) {
+    throw std::runtime_error(
+        "ptc: channel.color must be FLOAT32_VEC4, UFIXED8_VEC4 or "
+        "UFIXED8_RGBA_SRGB");
+  }
+  m_deepComp.resize(size.x, size.y);
+  m_color.resize(size.x * size.y * sizeof(anari::math::float4));
+  m_depth.resize(size.x * size.y);
+  m_composited.resize(size.x * size.y);
+#else
   if (m_currentColorType == ANARI_FLOAT32_VEC4) {
     throw std::runtime_error(
         "support for FLOAT32_VEC4 color channel not implemented");
   }
-
-  const auto &size = m_currentSize;
 
   m_deepComp.resize(size.x, size.y);
   m_color.resize(size.x * size.y * sizeof(anari::math::float4));
@@ -284,8 +330,101 @@ void FrameWrapper::updateSize()
   cudaMalloc((void **)&d_color_out, size.x * size.y * sizeof(*d_color_out));
   cudaMalloc((void **)&d_depth, size.x * size.y * sizeof(*d_depth));
   CUDA_SYNC_CHECK();
+#endif
 }
 
+#if DC_CPU
+void FrameWrapper::composite()
+{
+  if (m_composited.empty())
+    return;
+
+  dc::DeviceInterface dcDev = m_deepComp.prepare();
+
+  anari::math::uint2 size;
+  anari::math::uint2 depthSize;
+  ANARIDataType ptType = ANARI_UNKNOWN;
+  ANARIDataType depthType = ANARI_UNKNOWN;
+  const float *depth = (const float *)anariMapFrame(m_device,
+      m_frame,
+      "channel.depth",
+      &depthSize.x,
+      &depthSize.y,
+      &depthType);
+  const float *color = (const float *)anariMapFrame(
+      m_device, m_frame, "channel.color", &size.x, &size.y, &ptType);
+
+  if (color && depth && ptType == ANARI_FLOAT32_VEC4
+      && depthType == ANARI_FLOAT32 && size == m_currentSize
+      && depthSize == m_currentSize) {
+    // local depth for the (optional) depth channel of the wrapper
+    std::copy(depth, depth + size_t(size.x) * size.y, m_depth.begin());
+    // one fragment per covered pixel: premultiplied linear RGBA + depth
+    dc::writeImageFragments(dcDev, color, depth);
+  } else {
+    fprintf(stderr,
+        "ptc(rank %i): wrapped frame did not provide FLOAT32_VEC4 color "
+        "and FLOAT32 depth of the expected size, contributing nothing\n",
+        m_rank);
+  }
+
+  anariUnmapFrame(m_device, m_frame, "channel.depth");
+  anariUnmapFrame(m_device, m_frame, "channel.color");
+
+  m_deepComp.finish(m_rank == 0 ? m_composited.data() : nullptr);
+
+  if (m_rank != 0)
+    return;
+
+  // blend the optional background under the composited image
+  const int64_t numPixels = int64_t(m_currentSize.x) * m_currentSize.y;
+  if (m_background.w > 0.f) {
+    const auto bg = m_background;
+#pragma omp parallel for schedule(static)
+    for (int64_t i = 0; i < numPixels; i++) {
+      const uint32_t c = m_composited[i];
+      const float a = ((c >> 24) & 0xff) / 255.f;
+      const float bgc[4] = {bg.x * bg.w, bg.y * bg.w, bg.z * bg.w, bg.w};
+      uint32_t r = 0;
+      for (int k = 0; k < 4; k++) {
+        const float v = ((c >> (8 * k)) & 0xff) / 255.f + (1.f - a) * bgc[k];
+        r |= uint32_t(std::clamp(v, 0.f, 1.f) * 255.f + .5f) << (8 * k);
+      }
+      m_composited[i] = r;
+    }
+  }
+
+  // convert the composited (linear, 8-bit) pixels to the requested format
+  if (m_currentColorType == ANARI_FLOAT32_VEC4) {
+    float *out = (float *)m_color.data();
+#pragma omp parallel for schedule(static)
+    for (int64_t i = 0; i < numPixels; i++) {
+      const uint32_t c = m_composited[i];
+      for (int k = 0; k < 4; k++)
+        out[4 * i + k] = ((c >> (8 * k)) & 0xff) / 255.f;
+    }
+  } else if (m_currentColorType == ANARI_UFIXED8_RGBA_SRGB) {
+    uint32_t *out = (uint32_t *)m_color.data();
+#pragma omp parallel for schedule(static)
+    for (int64_t i = 0; i < numPixels; i++) {
+      const uint32_t c = m_composited[i];
+      uint32_t r = c & 0xff000000u;
+      for (int k = 0; k < 3; k++) {
+        const float l = ((c >> (8 * k)) & 0xff) / 255.f;
+        r |= uint32_t(linearToSrgb(l) * 255.f + .5f) << (8 * k);
+      }
+      out[i] = r;
+    }
+  } else {
+    std::memcpy(m_color.data(), m_composited.data(), numPixels * sizeof(uint32_t));
+  }
+}
+
+void FrameWrapper::cleanup()
+{
+  m_composited.clear();
+}
+#else
 void FrameWrapper::composite()
 {
   dc::DeviceInterface dcDev = m_deepComp.prepare();
@@ -337,5 +476,6 @@ void FrameWrapper::cleanup()
   d_color_in = nullptr;
   d_color_out = nullptr;
 }
+#endif
 
 } // namespace ptc

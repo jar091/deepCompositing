@@ -96,6 +96,15 @@ struct FrameWrapper : public helium::RefCounted
 
   std::vector<float> m_depth;
   std::vector<uint8_t> m_color;
+#if DC_CPU
+  /*! composited RGBA8 (linear, premultiplied, with coverage alpha) */
+  std::vector<uint32_t> m_composited;
+  /*! optional background blended under the composited image on rank 0
+      (frame parameter "ptc.background", FLOAT32_VEC4); lets all ranks
+      render with a transparent background, which data-parallel volume
+      rendering needs */
+  anari::math::float4 m_background{0.f, 0.f, 0.f, 0.f};
+#endif
   uint32_t *d_color_in{nullptr};
   uint32_t *d_color_out{nullptr};
   float *d_depth{nullptr};

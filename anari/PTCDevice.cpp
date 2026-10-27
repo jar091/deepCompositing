@@ -88,7 +88,8 @@ ANARIFrame PTCDevice::newFrame()
   initDevice();
   auto *fw = new FrameWrapper((ANARIDevice)m_ptd,
       m_ptd->newFrame(),
-      [=](const void *f) { this->removeFrameWrapper((FrameWrapper *)f); });
+      [=](const void *f) { this->removeFrameWrapper((FrameWrapper *)f); },
+      m_comm);
   m_frameWrappers.push_back(fw);
   return (ANARIFrame)fw;
 }
@@ -416,7 +417,11 @@ void PTCDevice::initDevice()
   reportMessage(ANARI_SEVERITY_DEBUG, "initializing PTC device (%p)", this);
 
   ANARILibrary lib = nullptr;
-  const char *libName = getenv("PTC_ANARI_LIBRARY");
+  // wrapped library: device parameter "wrappedLibrary" (set before the
+  // first object is created), else $PTC_ANARI_LIBRARY, else helide
+  const std::string wrappedLibrary = getParamString("wrappedLibrary", "");
+  const char *libName = !wrappedLibrary.empty() ? wrappedLibrary.c_str()
+                                                : getenv("PTC_ANARI_LIBRARY");
   if (libName) {
     lib = anariLoadLibrary(
         libName, defaultStatusCallback(), defaultStatusCallbackUserPtr());
@@ -454,7 +459,10 @@ void PTCDevice::initDevice()
 
 void PTCDevice::deviceCommitParameters()
 {
-  // TODO
+  // optional communicator for compositing (default: MPI_COMM_WORLD), e.g.
+  // the communicator of the solver ranks in an in-situ setup
+  auto *comm = getParam<void *>("mpiCommunicator", nullptr);
+  m_comm = comm ? *(const MPI_Comm *)comm : MPI_COMM_WORLD;
 }
 
 int PTCDevice::deviceGetProperty(

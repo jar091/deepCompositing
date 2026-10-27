@@ -84,8 +84,14 @@ namespace dctest {
     uint32_t *fbPointer = nullptr;
     uint32_t *fbHostPointer = nullptr;
     if (rank == 0) {
+#if DC_CPU
+      /* host build: the compositor writes straight into host memory */
+      fbHostPointer = (uint32_t *)malloc(fbSize.x*fbSize.y*sizeof(*fbPointer));
+      fbPointer = fbHostPointer;
+#else
       cudaMalloc(&fbPointer,fbSize.x*fbSize.y*sizeof(*fbPointer));
       fbHostPointer = (uint32_t *)malloc(fbSize.x*fbSize.y*sizeof(*fbPointer));
+#endif
     }
 
     if (outFileName != "") {
@@ -100,15 +106,19 @@ namespace dctest {
     // on root: write to file
     // ------------------------------------------------------------------
     if (rank == 0) {
+#if !DC_CPU
       cudaMemcpy(fbHostPointer,fbPointer,fbSize.x*fbSize.y*sizeof(*fbPointer),
                  cudaMemcpyDeviceToHost);
+#endif
       const std::string fileName
         = (outFileName=="")
         ? "testDeepOffline.png"
         : outFileName+".png";
       stbi_write_png(fileName.c_str(),fbSize.x,fbSize.y,4,
                      fbHostPointer,fbSize.x*sizeof(uint32_t));
+#if !DC_CPU
       cudaFree(fbPointer);
+#endif
       free(fbHostPointer);
     }
 
